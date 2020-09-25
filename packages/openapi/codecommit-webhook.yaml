@@ -1,0 +1,71 @@
+openapi: 3.0.0
+
+####################################
+# Information
+####################################
+info:
+  description: Webhook for trigger of codecommit/git sync
+  version: 1.0.0
+  title: CodeCommit Git Sync
+  contact:
+    email: pmatheson@dxc.com
+
+####################################
+# Paths
+####################################
+
+paths:
+  /:
+    post:
+      operationId: codecommit-sync
+      summary: sync codecommit with external git repo
+      description: >
+        Accepts webhook payload from external git repo and performs a sync with codecommit
+      responses:
+        "201":
+          description: repo synced
+        "400":
+          description: "invalid input"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+      x-amazon-apigateway-integration:
+        credentials:
+          Fn::Sub: "${ApiGatewayLambdaRole.Arn}"
+        uri:
+          Fn::Sub: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GitWebhook.Arn}/invocations"
+        responses:
+          default:
+            statusCode: "200"
+        passthroughBehavior: "when_no_match"
+        httpMethod: "POST"
+        contentHandling: "CONVERT_TO_TEXT"
+        type: "aws_proxy"
+
+    options:
+      responses:
+        200:
+          description: "200 response"
+          headers:
+            Access-Control-Allow-Origin:
+              type: "string"
+            Access-Control-Allow-Methods:
+              type: "string"
+            Access-Control-Allow-Headers:
+              type: "string"
+      x-amazon-apigateway-integration:
+        responses:
+          default:
+            statusCode: "200"
+            responseParameters:
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        requestTemplates:
+          application/json: "{'statusCode': 200}"
+        passthroughBehavior: "when_no_match"
+        type: "mock"

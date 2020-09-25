@@ -1,0 +1,15 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Soteria component stack
+Resources:
+  Common:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Join
+          - ''
+          - - 'https://s3.amazonaws.com/'
+            - !Join
+              - '-'
+              - - !Select [0, !Split ['-', !Ref AWS::StackName]]
+                - !Select [1, !Split ['-', !Ref AWS::StackName]]
+                - !Select [2, !Split ['-', !Ref AWS::StackName]]
+            - '-devops-cloudformation/common.yaml'

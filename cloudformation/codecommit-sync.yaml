@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Sync Git repo with CodeCommit
+
+Parameters:
+  StackName:
+    Type: String
+
+  #############################################
+
+Resources:
+
+  CodeCommitWebhook:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${StackName}-CodeCommitWebhook"
+      StageName: !Select [2, !Split ['-', !Ref AWS::StackName]] # abuse for disambiguation in github
+      DefinitionBody:
+        'Fn::Transform':
+          Name: 'AWS::Include'
+          Parameters:
+            Location: !Sub "s3://${StackName}/source/packages/openapi/codecommit-webhook.yaml"
+
+  #############################################
+
+  CodeCommitSync:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Syncs CodeCommit with external repo
+      FunctionName: !Sub "${StackName}-codecommit-sync"
+      Handler: lambda_function.lambda_handler
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:553035198032:layer:git-lambda2:6
+      Runtime: python3.8
+      Timeout: 600
+      MemorySize: 128
+      CodeUri: ../packages/codecommit-sync
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub
+              - "${Project}-${Tenant}-${Component}-*"
+              - Project: !Select [0, !Split ["-", !Ref AWS::StackName]]
+                Tenant: !Select [1, !Split ["-", !Ref AWS::StackName]]
+                Component: !Select [2, !Split ["-", !Ref AWS::StackName]]
+
+  GitWebhook:
+    # Entry point for github webhook
+    # Asynchronously calls CodeCommitSync passing webhook body and immediately returns 201
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: |
+        Entry point for github webhook
+        Asynchronously calls CodeCommitSync passing webhook body and immediately returns 201
+      FunctionName: !Sub "${StackName}-github-webhook"
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      Timeout: 5
+      MemorySize: 128
+      CodeUri: ../packages/github-webhook
+      Environment:
+        Variables:
+          ASYNC_FUNCTION_NAME: !Ref CodeCommitSync
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CodeCommitSync
+
+  #############################################
+
+  ApiGatewayLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApiGatewayLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt GitWebhook.Arn
+
+#############################################
+
+Outputs:
+  WebhookUrl:
+    Description: CodeCommitWebhook-Url
+    Value: !Sub
+      - "https://${CodeCommitWebhook}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/"
+      - Stage: !Select [2, !Split ['-', !Ref AWS::StackName]]

@@ -1,0 +1,687 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Soteria infrastructure/devops stack
+
+##########################################
+
+Parameters:
+  ProjectName:
+    Description: Project name (e.g. soteria)
+    Type: String
+    MinLength: 3
+    MaxLength: 31
+    AllowedPattern: "[a-z0-9]*"
+    Default: "soteria"
+
+  TenantName:
+    Description: Tenant name (e.g. dxc)
+    Type: String
+    MinLength: 3
+    MaxLength: 31
+    AllowedPattern: "[a-z0-9]*"
+    Default: "dxc"
+
+  WatchTenantBranch:
+    Description: Watching Tenant Branch
+    Type: String
+    Default: "false"
+
+  EnvironmentName:
+    Description: Environment name (e.g. dev)
+    Type: String
+    Default: "dev"
+    AllowedPattern: "[a-z0-9]*"
+
+  ComponentName:
+    Description: Component name (e.g. infrastructure)
+    Type: String
+    MinLength: 3
+    MaxLength: 31
+    AllowedPattern: "[a-z0-9-]*"
+    Default: "infrastructure"
+
+  TemplateFileName:
+    Default: cloudformation/index.yaml
+    Description: The file name of the CloudFormation template in its unpackaged form (before running aws cloudformation package)
+    MinLength: 1
+    Type: String
+
+  PackagedTemplateFileName:
+    Default: cloudformation/index-packaged.yaml
+    MinLength: 1
+    Description: The file name of the CloudFormation template in its packaged form (after running aws cloudformation package)
+    Type: String
+
+  ProductionApproversEmail:
+    Description: The email address where CodePipeline sends pipeline notifications
+    Type: String
+
+  ProductionApproversSms:
+    Description: The mobile number where CodePipeline sends pipeline notifications
+    Type: String
+
+##########################################
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentName, prd]
+  IsStaging: !Equals [!Ref EnvironmentName, stg]
+  IsDevelopment: !Equals [!Ref EnvironmentName, dev]
+  IsSandbox: !Equals [!Ref EnvironmentName, sbx]
+  IsWatchTenantBranch: !Equals [!Ref WatchTenantBranch, "true"]
+
+##########################################
+
+Resources:
+
+  CodePipelineSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref ProductionApproversEmail
+          Protocol: email
+        - Endpoint: !Ref ProductionApproversSms
+          Protocol: sms
+
+  ##########################################
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Sub ${ProjectName}-${TenantName}-${EnvironmentName}-devops-codepipeline
+        Type: S3
+      DisableInboundStageTransitions: []
+      Name: !Sub "${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: "1"
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                BranchName: !If [
+                  IsWatchTenantBranch,
+                  !Ref TenantName,
+                  !If [
+                    IsSandbox,
+                    sandbox,
+                    !If [
+                      IsDevelopment,
+                      master,
+                      !If [
+                        IsStaging,
+                        production,
+                        !If [
+                          IsProduction,
+                          production,
+                          !Ref TenantName
+                        ]
+                      ]
+                    ]
+                  ]
+                ]
+                RepositoryName: !Sub ${ProjectName}-${ComponentName}
+                PollForSourceChanges: false
+              RunOrder: 1
+
+        - Name: Package
+          Actions:
+            - Name: Package
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: TemplateSource
+              OutputArtifacts:
+                - Name: PackageArtifacts
+              Configuration:
+                ProjectName: !Ref CodeBuildPackage
+
+        - Name: Deployment
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              InputArtifacts:
+                - Name: PackageArtifacts
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn: !GetAtt CloudFormationRole.Arn
+                StackName: !Sub ${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}
+                ChangeSetName: !Sub ${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}-change-set
+                TemplateConfiguration: !Sub PackageArtifacts::config/${ProjectName}-${TenantName}-${EnvironmentName}.json
+                TemplatePath: !Sub PackageArtifacts::${PackagedTemplateFileName}
+              RunOrder: 1
+
+            - !If
+              - IsProduction
+              - Name: ApproveChangeSet
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: "1"
+                Configuration:
+                  NotificationArn: !Ref CodePipelineSNSTopic
+                  CustomData: !Sub "A new change set was created for the ${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName} stack. Do you want to implement the changes?"
+                RunOrder: 2
+              - !Ref AWS::NoValue
+
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                #! This needs to be addressed
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: !Sub ${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}-change-set
+                RoleArn: !GetAtt CloudFormationRole.Arn
+                StackName: !Sub ${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}
+              RunOrder: 3
+
+        - Name: Test
+          Actions:
+            - Name: UnitTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: TemplateSource
+              OutputArtifacts:
+                - Name: PackageTestArtifacts
+              Configuration:
+                ProjectName: !Ref CodeBuildTest
+
+  ##########################################
+
+  CodeBuildPackage:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}"
+      Description: Package cloudformation template and ready for deployment
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+      TimeoutInMinutes: 10
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            variables:
+              TEMPLATE_INPUT: ${TemplateFileName}
+              PACKAGED_TEMPLATE: ${PackagedTemplateFileName}
+              COMPONENT: ${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}
+              ORIGIN: ${ProjectName}-${TenantName}-${EnvironmentName}-distribution-origin
+              OPENAPI: ${ProjectName}-${TenantName}-${EnvironmentName}-api-openapi
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 12
+                python: 3.8
+              commands:
+                - echo Entered the install phase...
+              finally:
+                - echo This always runs even if the update or install command fails
+            pre_build:
+              commands:
+                - echo Check if $COMPONENT bucket exists yet or exit to let it be created on the first pipeline invocation
+                - >
+                  if aws s3api head-bucket --bucket $COMPONENT; then
+                    echo "Syncing repository to s3://$COMPONENT/source";
+                    aws s3 sync --no-progress --delete . s3://$COMPONENT/source;
+                  else
+                    echo "Skipping sync to s3://$COMPONENT/source on first ever invocation";
+                  fi
+                - echo Creating .env file for both build and deployment use
+                - echo "PROJECT=${ProjectName}" > .env
+                - echo "TENANT=${TenantName}" >> .env
+                - echo "ENVIRONMENT=${EnvironmentName}" >> .env
+                - echo "COMPONENT=${ComponentName}" >> .env
+                - echo "NAME=${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}" >> .env
+                - echo "USER_DOMAIN=$(aws cloudformation list-exports --query 'Exports[?Name==`${ProjectName}-${TenantName}-${EnvironmentName}-domains-UserDomainName`].Value' --output text)" >> .env || true
+                - echo "API_USER_DOMAIN=$(aws cloudformation list-exports --query 'Exports[?Name==`${ProjectName}-${TenantName}-${EnvironmentName}-api-domainName`].Value' --output text)" >> .env || true
+                - echo "PUBLIC_DOMAIN=$(aws cloudformation list-exports --query 'Exports[?Name==`${ProjectName}-${TenantName}-${EnvironmentName}-domains-PublicDomainName`].Value' --output text)" >> .env || true
+              finally:
+                - echo This always runs even if the login command fails
+            build:
+              commands:
+                - echo Entered the build phase...
+                - echo Build started on `date`
+                - echo "Processing /packages/* directories..."
+                - >
+                  if test -d packages; then
+                    pushd packages
+                      for d in `basename '*/'`; do
+                        echo Packaging $d...;
+
+                        if test -f $d/requirements.txt; then # Python
+                          echo $d: installing python requirements...;
+                          pip install --target=$d -r $d/requirements.txt;
+                        fi
+
+                        if test -f $d/nodejs/package.json; then
+                          echo $d: installing Node.js requirements for layer;
+                          npm --prefix $d/nodejs install $d/nodejs/;
+                        fi
+
+                        if test -f $d/package.json; then # Node.js
+                          echo $d: installing Node.js requirements;
+
+                          if grep -q react $d/package.json; then # React
+                            if [ -f ../.env ]; then # prefix envars with REACT_APP_ for security
+                              sed -e 's/^/REACT_APP_/' ../.env > $d/.env;
+                            fi
+                          fi
+
+                          npm --prefix $d install $d/;
+
+                          if grep -q build $d/package.json; then # TODO parse json for scripts['build']
+                            npm --prefix $d --project=${ProjectName} --tenant=${TenantName} --environment=${EnvironmentName} run build $d/;
+                          fi
+                        fi
+
+                        # zip directory (zip returns error 12 when empty)
+                        pushd ./$d
+                          echo $d: archiving to $d.zip file;
+                          zip -r9 "../$d.zip" . 2>&1 >/dev/null;
+                        popd
+
+                        if [ $d = "webroot" ]; then # copy in place for 'distribution' component
+                          if aws s3api head-bucket --bucket $ORIGIN; then
+                            if [ -d webroot/build ]; then
+                              echo "Syncing /packages/webroot/build to s3://$ORIGIN/${ComponentName}";
+                              aws s3 sync --no-progress --delete webroot/build s3://$ORIGIN/${ComponentName};
+                            else
+                              echo "Syncing /packages/webroot to s3://$ORIGIN/${ComponentName}";
+                              aws s3 sync --no-progress --delete --cache-control max-age=31536000 webroot s3://$ORIGIN/${ComponentName};
+                            fi
+
+                            # invalidate all existing cached content for this component
+                            CLOUDFRONT_ARN=$(aws cloudformation list-exports --query 'Exports[?Name==`${ProjectName}-${TenantName}-${EnvironmentName}-domains-PublicDomainName`].Value' --output text) || true
+                            if $CLOUDFRONT_ARN; then aws cloudfront create-invalidation --paths "/${ComponentName}*"; fi
+                          else
+                            echo "Skipping sync of /packages/webroot[/build] to s3://$ORIGIN/${ComponentName}[/build] as the bucket does not exist";
+                            echo "This will likely result in your web interface not being available";
+                          fi
+                        fi
+
+                        if [ $d = "openapi" ]; then # copy in place for cloudformation deployment
+                          if aws s3api head-bucket --bucket $OPENAPI; then
+                            echo "Syncing openapi to s3://$OPENAPI/${ComponentName}";
+                            aws s3 sync --no-progress --delete openapi s3://$OPENAPI/${ComponentName};
+                          else
+                            echo "Bucket does not exist s3://$OPENAPI/${ComponentName}";
+                            echo "This will likely result in CloudFormation deploy failure if reliant on openapi";
+                          fi
+                        fi
+                      done
+                    popd
+                  fi
+                - >
+                  aws cloudformation package
+                  --template-file ${TemplateFileName}
+                  --s3-bucket ${ProjectName}-${TenantName}-${EnvironmentName}-devops-cloudformation
+                  --s3-prefix ${ComponentName}
+                  --output-template-file ${PackagedTemplateFileName}
+              finally:
+                - echo This always runs even if the install command fails
+            post_build:
+              commands:
+                - echo Entered the post_build phase...
+                - echo Build completed on `date`
+                - >
+                  if aws s3api head-bucket --bucket $COMPONENT; then
+                    echo "Syncing repository to s3://$COMPONENT/output";
+                    aws s3 sync --no-progress --delete --exclude "*/node_modules/*" . s3://$COMPONENT/output;
+                  else
+                    echo "Skipping sync to s3://$COMPONENT/output on first ever invocation";
+                  fi
+          artifacts:
+            # Save all files as artifacts
+            base-directory: $CODEBUILD_SRC_DIR
+            files:
+              - 'cloudformation/index-packaged.yaml'
+              - 'config/**'
+
+  ##########################################
+  CodeBuildTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}-test"
+      Description: CodeBuild Project to execute Postman Scripts using Postman CLI (newman)
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+      TimeoutInMinutes: 10
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            variables:
+              COMPONENT: ${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 12
+              commands:
+                - echo Entered the install phase...
+                - npm install -g newman
+              finally:
+                - echo This always runs even if the update or install command fails
+            build:
+              commands:
+                - echo Entered the build phase...
+                - echo Build started on `date`
+                - >
+                  if test -d test; then
+                    pushd test                    
+                    newman run postman-collection.json --insecure --global-var API_BASE_URL=$(aws cloudformation list-exports --query 'Exports[?Name==`${ProjectName}-${TenantName}-${EnvironmentName}-api-domainName`].Value' --output text) --global-var API_KEY=$(aws ssm get-parameters --region ${AWS::Region} --names "${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}-apikey" --query "Parameters[*].{Value:Value}[0].Value" --with-decryption --output text) -r junit
+                    popd
+                  fi
+              finally:
+                - echo This always runs even if the install command fails
+          reports:
+            JUnitReports: # CodeBuild will create a report group called "SurefireReports".
+              files: #Store all of the files
+              - '**/*'
+              discard-paths: yes
+  ##########################################
+
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}-devops-cloudformation"
+      Description: Allows CloudPipeline to call CloudFormation to create infrastructure as code.
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+        Version: 2012-10-17
+      Path: /
+      Policies:
+        - PolicyName: "cloudformation-policy"
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  # - s3:GetObject
+                  # - s3:GetObjectVersion
+                  # - s3:GetBucketVersioning
+                  - "*"
+                Effect: Allow
+                Resource:
+                  - "*"
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}-devops-codepipeline"
+      Description: Allows CodePipeline to access resources it needs to build and deploy components.
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+        Version: 2012-10-17
+      Path: /
+      Policies:
+        - PolicyName: "codepipeline-policy"
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${ProjectName}-${TenantName}-${EnvironmentName}-devops-codepipeline/*
+              - Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${ComponentName}
+              - Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StopBuild
+                Effect: Allow
+                Resource:
+                  - !GetAtt CodeBuildPackage.Arn
+                  - !GetAtt CodeBuildTest.Arn
+              - Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ProjectName}*
+                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ProjectName}*
+                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:${ProjectName}*
+              - Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:UpdateStack
+                  - cloudformation:SetStackPolicy
+                  # Valid Above, but needs more testing without '*''
+                  - cloudformation:*
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*
+              - Action:
+                  - iam:PassRole
+                Effect: Allow
+                Resource: !GetAtt CloudFormationRole.Arn
+              - Action:
+                  - sns:Publish
+                Effect: Allow
+                Resource:
+                  - !Ref CodePipelineSNSTopic
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}-devops-codebuild"
+      Description: Allows CodeBuild to create containers and build from source for deployment.
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: "codebuild-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - codebuild:StopBuild
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:codebuild:*:*:project/${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}
+              - Action:
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:ListObjectsV2
+                  - s3:DeleteObject
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${ProjectName}-${TenantName}-${EnvironmentName}-devops-*
+                  - !Sub arn:aws:s3:::${ProjectName}-${TenantName}-${EnvironmentName}-${ComponentName}*
+                  - !Sub arn:aws:s3:::${ProjectName}-${TenantName}-${EnvironmentName}-distribution-origin
+                  - !Sub arn:aws:s3:::${ProjectName}-${TenantName}-${EnvironmentName}-distribution-origin/*
+                  - !Sub arn:aws:s3:::${ProjectName}-${TenantName}-${EnvironmentName}-api
+                  - !Sub arn:aws:s3:::${ProjectName}-${TenantName}-${EnvironmentName}-api/*
+                  - !Sub arn:aws:s3:::${ProjectName}-${TenantName}-${EnvironmentName}-api-openapi
+                  - !Sub arn:aws:s3:::${ProjectName}-${TenantName}-${EnvironmentName}-api-openapi/*
+        - PolicyName: codebuild-logs
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:CreateLogGroup"
+                  - "cloudfront:CreateInvalidation"
+                Resource: "*"
+                Effect: Allow
+        - PolicyName: cloudformation-list-exports
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - "cloudformation:ListExports"
+                Resource: "*"
+                Effect: Allow
+        - PolicyName: codebuild-reports
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - "codebuild:CreateReportGroup"
+                  - "codebuild:CreateReport"
+                  - "codebuild:UpdateReport"
+                  - "codebuild:BatchPutTestCases"
+                Resource: "*"
+                Effect: "Allow"
+        - PolicyName: ssm-getparameters
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - "ssm:GetParameters"
+                Resource: "*"
+                Effect: "Allow"
+
+  PipelineWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        -
+          PolicyName: pipeline-execution-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource:
+                  !Join
+                    - ''
+                    - - 'arn:aws:codepipeline:'
+                      - !Ref 'AWS::Region'
+                      - ':'
+                      - !Ref 'AWS::AccountId'
+                      - ':'
+                      - !Ref CodePipeline
+
+  PipelineWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Join 
+              - ''
+              - - 'arn:aws:codecommit:'
+                - !Ref 'AWS::Region'
+                - ':'
+                - !Ref 'AWS::AccountId'
+                - ':'
+                - !Sub '${ProjectName}-${ComponentName}'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !If [
+                IsWatchTenantBranch,
+                !Ref TenantName,
+                !If [
+                  IsSandbox,
+                  sandbox,
+                  !If [
+                    IsDevelopment,
+                    master,
+                    !If [
+                      IsStaging,
+                      production,
+                      !If [
+                        IsProduction,
+                        production,
+                        !Ref TenantName
+                      ]
+                    ]
+                  ]
+                ]
+              ]
+      Targets:
+        -
+          Arn: 
+            !Join
+              - ''
+              - - 'arn:aws:codepipeline:'
+                - !Ref 'AWS::Region'
+                - ':'
+                - !Ref 'AWS::AccountId'
+                - ':'
+                - !Ref CodePipeline
+          RoleArn: !GetAtt PipelineWatchEventRole.Arn
+          Id: codepipeline-CodePipeline

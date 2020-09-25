@@ -1,0 +1,22 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Soteria devops stack
+
+  #############################################
+
+Resources:
+
+  CodeCommitWebhook:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: codecommit-sync.yaml
+      Parameters:
+        StackName: !Ref AWS::StackName
+
+  #############################################
+
+Outputs:
+  CodeCommitWebhook:
+    Description: CodeCommitWebhook Url
+    Value: !GetAtt CodeCommitWebhook.Outputs.WebhookUrl
+    Export:
+      Name: !Sub "${AWS::StackName}-webhook"
